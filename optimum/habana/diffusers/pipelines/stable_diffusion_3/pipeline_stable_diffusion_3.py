@@ -214,9 +214,6 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
             ):
                 prompt_embeds_batches[i] = torch.cat([negative_prompt_embeds_batch, prompt_embeds_batch])
 
-            # for i in range(5):
-            #     print("latents, prompt embeds batches ", i ," = ", len(prompt_embeds_batches[i]) )
-        
         prompt_embeds_batches = torch.stack(prompt_embeds_batches)
 
         
@@ -235,9 +232,6 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
             pooled_prompt_embeds_batches = torch.stack(pooled_prompt_embeds_batches)
         else:
             pooled_prompt_embeds_batches = None
-
-        # for i in range(5):
-        #     print(" pooled prompt embeds batches ", i ," = ", len(pooled_prompt_embeds_batches[i]) )
 
         return latents_batches, prompt_embeds_batches, pooled_prompt_embeds_batches, num_dummy_samples
 
@@ -482,7 +476,7 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
                 record_shapes=False,
             )
 
-
+            hb_profiler.start()
 
             # 6. Split Input data to batches (HPU-specific step)
 
@@ -499,29 +493,29 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
                 "images": [],
             }
 
-            
             # 7. Denoising loop
-            for j in (range(num_batches)):
+            for j in range(num_batches):
+                with self.progress_bar(range(num_inference_steps)) as progress_bar:
 
-                if hasattr(self.scheduler, "_init_step_index"):
+                    latents_batch = latents_batches[0]
+                    latents_batches = torch.roll(latents_batches, shifts=-1, dims=0)
+                    text_embeddings_batch = text_embeddings_batches[0]
+                    text_embeddings_batches = torch.roll(text_embeddings_batches, shifts=-1, dims=0)
+                    pooled_prompt_embeddings_batch = pooled_prompt_embeddings_batches[0]
+                    pooled_prompt_embeddings_batches = torch.roll(pooled_prompt_embeddings_batches, shifts=-1, dims=0)
+                    print("Latent batches size =", latents_batch.shape)
+                    print("text_embeddings_batch size  = ", text_embeddings_batch.shape)
+                    print("pooled_prompt_embeddings_batch size= ", pooled_prompt_embeddings_batch.shape)
+
+                    if hasattr(self.scheduler, "_init_step_index"):
                         # Reset scheduler step index for next batch
+                        self.scheduler.timesteps = timesteps
                         self.scheduler._init_step_index(timesteps[0])
 
-                latents_batch = latents_batches[0]
-                latents_batches = torch.roll(latents_batches, shifts=-1, dims=0)
-                text_embeddings_batch = text_embeddings_batches[0]
-                text_embeddings_batches = torch.roll(text_embeddings_batches, shifts=-1, dims=0)
-                pooled_prompt_embeddings_batch = pooled_prompt_embeddings_batches[0]
-                pooled_prompt_embeddings_batches = torch.roll(pooled_prompt_embeddings_batches, shifts=-1, dims=0)
-                print("Latent batches size =", latents_batch.shape)
-                print("text_embeddings_batch size  = ", text_embeddings_batch.shape)
-                print("pooled_prompt_embeddings_batch size= ", pooled_prompt_embeddings_batch.shape)
 
-
-                with self.progress_bar(range(num_inference_steps)) as progress_bar:
-                    hb_profiler.start()
-
-                    for i, t in enumerate(timesteps):
+                    for i in range(len(timesteps)):
+                        timestep = timesteps[0]
+                        timesteps = torch.roll(timesteps, shifts=-1, dims=0)
 
                         # because compilation occurs in the first two iterations
                         if i == throughput_warmup_steps:
@@ -530,12 +524,10 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
                         if self.interrupt:
                             continue
 
-                        
-
                         # expand the latents if we are doing classifier free guidance
                         latent_model_input = torch.cat([latents_batch] * 2) if self.do_classifier_free_guidance else latents_batch
                         # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-                        timestep = t.expand(latent_model_input.shape[0])
+                        timestep = timestep.expand(latent_model_input.shape[0])
 
                         noise_pred = self.transformer_hpu(
                             latent_model_input,
@@ -553,7 +545,7 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
 
                         # compute the previous noisy sample x_t -> x_t-1
                         latents_dtype = latents_batch.dtype
-                        latents_batch = self.scheduler.step(noise_pred, t, latents_batch, return_dict=False)[0]
+                        latents_batch = self.scheduler.step(noise_pred, timestep, latents_batch, return_dict=False)[0]
 
 
                         if latents_batch.dtype != latents_dtype:
@@ -566,7 +558,7 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
                             callback_kwargs = {}
                             for k in callback_on_step_end_tensor_inputs:
                                 callback_kwargs[k] = locals()[k]
-                            callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+                            callback_outputs = callback_on_step_end(self, i, timestep, callback_kwargs)
 
                             latents_batch = callback_outputs.pop("latents", latents_batch)
 
@@ -583,24 +575,24 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
                         # call the callback, if provided
                         if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                             progress_bar.update()
+                        
 
                         hb_profiler.step()
                         if not self.use_hpu_graphs:
                             htcore.mark_step(sync=True)
                     
-                    
-                    hb_profiler.stop()
+                hb_profiler.stop()
 
-                    t1 = warmup_inference_steps_time_adjustment(t1, t1, num_inference_steps, throughput_warmup_steps)
-                    speed_metrics_prefix = "generation"
-                    speed_measures = speed_metrics(
-                        split=speed_metrics_prefix,
-                        start_time=t0,
-                        num_samples=num_batches * batch_size,
-                        num_steps=num_batches * batch_size * num_inference_steps,
-                        start_time_after_warmup=t1,
-                    )
-                    logger.info(f"Speed metrics: {speed_measures}")
+                t1 = warmup_inference_steps_time_adjustment(t1, t1, num_inference_steps, throughput_warmup_steps)
+                speed_metrics_prefix = "generation"
+                speed_measures = speed_metrics(
+                    split=speed_metrics_prefix,
+                    start_time=t0,
+                    num_samples=num_batches * batch_size,
+                    num_steps=num_batches * batch_size * num_inference_steps,
+                    start_time_after_warmup=t1,
+                )
+                logger.info(f"Speed metrics: {speed_measures}")
 
                 if output_type == "latent":
                     image = latents_batch
@@ -703,12 +695,9 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
             joint_attention_kwargs
         ]
         h = self.ht.hpu.graphs.input_hash(inputs)
-        print(h)
         cached = self.cache.get(h)
-        print(timestep.shape)
 
         if cached is None:
-            print("not cached")
             # Capture the graph and cache it
             with self.ht.hpu.stream(self.hpu_stream):
                 graph = self.ht.hpu.HPUGraph()
