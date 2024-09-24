@@ -42,6 +42,10 @@ from ....transformers.gaudi_configuration import GaudiConfig
 from ....utils import HabanaProfile, speed_metrics, warmup_inference_steps_time_adjustment
 from ..pipeline_utils import GaudiDiffusionPipeline
 
+import habana_frameworks.torch.hpu as htcore
+import habana_frameworks.torch as ht
+import habana_frameworks.torch.hpu as hthpu
+
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -491,13 +495,12 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
                 "images": [],
             }
 
-            # Set which Batch to Profile
-            profile_batch = 0
+            profile_batch = 2
             
             # 7. Denoising loop
             for j in range(num_batches):
 
-                if j == profile_batch:
+                if j == profile_batch and profiling_steps:
                     print(f"Profiling {j} batch ")
                     hb_profiler.start()
 
@@ -509,11 +512,16 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
                     text_embeddings_batches = torch.roll(text_embeddings_batches, shifts=-1, dims=0)
                     pooled_prompt_embeddings_batch = pooled_prompt_embeddings_batches[0]
                     pooled_prompt_embeddings_batches = torch.roll(pooled_prompt_embeddings_batches, shifts=-1, dims=0)
+                    # print("Latent batches size =", latents_batch.shape)
+                    # print("text_embeddings_batch size  = ", text_embeddings_batch.shape)
+                    # print("pooled_prompt_embeddings_batch size= ", pooled_prompt_embeddings_batch.shape)
 
                     if hasattr(self.scheduler, "_init_step_index"):
                         # Reset scheduler step index for next batch
                         self.scheduler.timesteps = timesteps
                         self.scheduler._init_step_index(timesteps[0])
+
+                    t5 = time.time()
 
                     for i in range(len(timesteps)):
                         timestep = timesteps[0]
@@ -531,6 +539,7 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
                         # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                         timestep = timestep.expand(latent_model_input.shape[0])
 
+                        # t3 = time.time()
 
                         noise_pred = self.transformer_hpu(
                             latent_model_input,
@@ -539,6 +548,10 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
                             pooled_prompt_embeddings_batch,
                             self.joint_attention_kwargs,
                         )
+                        # t4 = time.time()
+
+                        # print("transformer loop time ", t4-t3)
+
 
                         # perform guidance
                         if self.do_classifier_free_guidance:
@@ -548,6 +561,7 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
                         # compute the previous noisy sample x_t -> x_t-1
                         latents_dtype = latents_batch.dtype
                         latents_batch = self.scheduler.step(noise_pred, timestep, latents_batch, return_dict=False)[0]
+
 
                         if latents_batch.dtype != latents_dtype:
                             if torch.backends.mps.is_available():
@@ -583,6 +597,9 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
                         if not self.use_hpu_graphs:
                             htcore.mark_step(sync=True)
                     
+                    t6 = time.time()
+                    print(f"Time for {j} batch = ",t6-t5) 
+
                 if j == profile_batch:
                     hb_profiler.stop()
 
@@ -591,7 +608,7 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
                 speed_measures = speed_metrics(
                     split=speed_metrics_prefix,
                     start_time=t0,
-                    num_samples= 1,   # Samples is treated as 1 whole batch (made to match Nvidia measurements)
+                    num_samples= batch_size,
                     num_steps= batch_size * num_inference_steps,
                     start_time_after_warmup=t1,
                 )
@@ -607,6 +624,8 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
                     image = self.image_processor.postprocess(image, output_type=output_type)
                 
                 outputs["images"].append(image)
+
+
 
 
             # 8 Output Images
@@ -650,6 +669,8 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
             )
 
 
+
+
     @torch.no_grad()
     def transformer_hpu(
         self,
@@ -669,6 +690,11 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
                 joint_attention_kwargs,
             )
         else:
+
+            hthpu.htcore.hpu.synchronize()
+            memory_before_graph = hthpu.memory.memory_allocated()
+            print(f"Memory being alloted: {memory_before_graph / 1e6} MB")
+
             return self.transformer(
                 hidden_states=latent_model_input,
                 timestep=timestep,
@@ -677,6 +703,8 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
                 joint_attention_kwargs=joint_attention_kwargs,
                 return_dict=False,
             )[0]
+
+
 
     @torch.no_grad()
     def capture_replay(
@@ -694,6 +722,12 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
             pooled_prompt_embeddings_batch,
             joint_attention_kwargs
         ]
+        # Non-blocking data transfer to Gaudi
+        # inputs = [
+        #     x.to('hpu', non_blocking=True) if x is not None else None
+        #     for x in inputs
+        # ]
+
         h = self.ht.hpu.graphs.input_hash(inputs)
         cached = self.cache.get(h)
 
@@ -702,6 +736,11 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
             with self.ht.hpu.stream(self.hpu_stream):
                 graph = self.ht.hpu.HPUGraph()
                 graph.capture_begin()
+
+
+                # Before passing inputs to the model
+                memory_before = hthpu.memory.memory_allocated()
+                print(f"Memory before passing inputs: {memory_before / 1e6} MB")
 
                 outputs = self.transformer(
                     hidden_states=inputs[0],
@@ -712,16 +751,32 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
                     return_dict=False,
                 )[0]
 
+                # After passing inputs to the model
+                hthpu.htcore.hpu.synchronize()  # Ensure all async operations are finished
+                memory_after = hthpu.memory.memory_allocated()
+                print(f"Memory after passing inputs: {memory_after / 1e6} MB")
+
                 graph.capture_end()
                 graph_inputs = inputs
                 graph_outputs = outputs
                 self.cache[h] = self.ht.hpu.graphs.CachedParams(graph_inputs, graph_outputs, graph)
                 print(self.cache[h])
             return outputs
+        
+        hthpu.htcore.hpu.synchronize()
+        memory_before_graph = hthpu.memory.memory_allocated()
+        print(f"Memory being alloted before graph replay: {memory_before_graph / 1e6} MB")
 
         # Replay the cached graph with updated inputs
         self.ht.hpu.graphs.copy_to(cached.graph_inputs, inputs)
         cached.graph.replay()
         self.ht.core.hpu.default_stream().synchronize()
+
+        hthpu.htcore.hpu.synchronize()
+        memory_after_graph = hthpu.memory.memory_allocated()
+        print(f"Memory being alloted after graph replay: {memory_after_graph / 1e6} MB")
+
+
+        
 
         return cached.graph_outputs
