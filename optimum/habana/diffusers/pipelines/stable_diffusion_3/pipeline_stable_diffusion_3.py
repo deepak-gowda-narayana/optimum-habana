@@ -474,12 +474,6 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
             t0 = time.time()
             t1 = t0
 
-            hb_profiler = HabanaProfile(
-                warmup=profiling_warmup_steps,
-                active=profiling_steps,
-                record_shapes=False,
-            )
-
             # 6. Split Input data to batches (HPU-specific step)
 
             latents_batches, text_embeddings_batches, pooled_prompt_embeddings_batches, num_dummy_samples = self._split_inputs_into_batches(
@@ -495,14 +489,20 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
                 "images": [],
             }
 
-            profile_batch = 2
+            
+            hb_profiler = HabanaProfile(
+                warmup=profiling_warmup_steps,
+                active=profiling_steps,
+                record_shapes=False,
+            )
+            hb_profiler.start()
+
+
             
             # 7. Denoising loop
             for j in range(num_batches):
 
                 if j == profile_batch and profiling_steps:
-                    print(f"Profiling {j} batch ")
-                    hb_profiler.start()
 
                 with self.progress_bar(range(num_inference_steps)) as progress_bar:
 
@@ -591,8 +591,7 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
                         if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                             progress_bar.update()
                         
-                        if j == profile_batch:
-                            hb_profiler.step()
+                        hb_profiler.step()
 
                         if not self.use_hpu_graphs:
                             htcore.mark_step(sync=True)
@@ -600,8 +599,6 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
                     t6 = time.time()
                     print(f"Time for {j} batch = ",t6-t5) 
 
-                if j == profile_batch:
-                    hb_profiler.stop()
 
                 t1 = warmup_inference_steps_time_adjustment(t1, t1, num_inference_steps, throughput_warmup_steps)
                 speed_metrics_prefix = "generation"
@@ -626,7 +623,7 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
                 outputs["images"].append(image)
 
 
-
+            hb_profiler.stop()
 
             # 8 Output Images
             # Remove dummy generations if needed
