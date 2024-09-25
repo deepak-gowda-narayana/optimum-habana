@@ -502,8 +502,6 @@ class GaudiStableDiffusion3Pipeline(GaudiDiffusionPipeline, StableDiffusion3Pipe
             # 7. Denoising loop
             for j in range(num_batches):
 
-                if j == profile_batch and profiling_steps:
-
                 with self.progress_bar(range(num_inference_steps)) as progress_bar:
 
                     latents_batch = latents_batches[0]
