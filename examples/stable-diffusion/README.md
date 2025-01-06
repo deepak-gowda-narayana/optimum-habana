@@ -337,7 +337,6 @@ huggingface-cli login
 Here is how to generate SD3 images with a single prompt:
 
 ```bash
-PT_HPU_MAX_COMPOUND_OP_SIZE=1 \
 python text_to_image_generation.py \
     --model_name_or_path stabilityai/stable-diffusion-3-medium-diffusers \
     --prompts "Sailing ship painting by Van Gogh" \
@@ -353,8 +352,46 @@ python text_to_image_generation.py \
     --bf16
 ```
 
-> For improved performance of the SD3 pipeline on Gaudi, it is recommended to configure the environment
-> by setting PT_HPU_MAX_COMPOUND_OP_SIZE to 1.
+Here is how to generate SD3 images with a single prompt with FP8 precision. First we run the measure command to generate stats for quantization:
+
+```bash
+QUANT_CONFIG=quantization/stable-diffusion-3/measure_config.json \
+PT_HPU_WEIGHT_SHARING=0 \
+python text_to_image_generation.py \
+    --model_name_or_path stabilityai/stable-diffusion-3-medium-diffusers \
+    --prompts "Sailing ship painting by Van Gogh" \
+    --num_images_per_prompt 10 \
+    --batch_size 1 \
+    --num_inference_steps 28 \
+    --image_save_dir /tmp/stable_diffusion_3_images \
+    --scheduler default \
+    --use_habana \
+    --use_hpu_graphs \
+    --gaudi_config Habana/stable-diffusion \
+    --sdp_on_bf16 \
+    --bf16
+    --quant_mode measure
+```
+
+Second, we run quantization command:
+```bash
+QUANT_CONFIG=quantization/stable-diffusion-3/quantize_config.json \
+PT_HPU_WEIGHT_SHARING=0 \
+python text_to_image_generation.py \
+    --model_name_or_path stabilityai/stable-diffusion-3-medium-diffusers \
+    --prompts "Sailing ship painting by Van Gogh" \
+    --num_images_per_prompt 10 \
+    --batch_size 1 \
+    --num_inference_steps 28 \
+    --image_save_dir /tmp/stable_diffusion_3_images \
+    --scheduler default \
+    --use_habana \
+    --use_hpu_graphs \
+    --gaudi_config Habana/stable-diffusion \
+    --sdp_on_bf16 \
+    --bf16
+    --quant_mode quantize
+```
 
 ### FLUX.1
 
