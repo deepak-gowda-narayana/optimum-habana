@@ -1594,6 +1594,15 @@ class GaudiTrainer(Trainer):
         inputs = self._prepare_inputs(inputs)
 
         with self.compute_loss_context_manager():
+            def backward_hook(module, grad_input, grad_output):
+                for i, g in enumerate(grad_output):
+                    if g is not None and torch.isnan(g).any():
+                        logger.warning(f"NaN detected in lora parameter gradients")
+
+            for name, module in model.named_modules():
+                if 'lora' in name.lower():
+                    module.register_full_backward_hook(backward_hook)
+                    
             loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
 
         del inputs
