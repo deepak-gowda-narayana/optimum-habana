@@ -159,7 +159,7 @@ def _get_input_update_settings(model, lazy_mode: Optional[bool] = None) -> Tuple
     inputs_update: Dict = {}
 
     should_update_inputs = (getattr(model, "generation_config", None) is not None) and (
-        model.config.model_type in ("llama", "qwen2", "starcoder2", "gemma", "baichuan", "chatglm", "deepseek_v2")
+        model.config.model_type in ("llama", "qwen2", "starcoder2", "gemma", "baichuan", "chatglm", "deepseek_v2" )
     )
     if should_update_inputs:
         if model.generation_config.attn_softmax_bf16:
@@ -170,7 +170,7 @@ def _get_input_update_settings(model, lazy_mode: Optional[bool] = None) -> Tuple
             inputs_update["flash_attention_recompute"] = True
         if model.generation_config.flash_attention_causal_mask:
             inputs_update["flash_attention_causal_mask"] = True
-
+    
     should_update_inputs = (
         (getattr(model, "generation_config", None) is not None)
         and (model.config.model_type in ("llama", "qwen2", "starcoder2", "mistral"))
@@ -1604,7 +1604,18 @@ class GaudiTrainer(Trainer):
         inputs = self._prepare_inputs(inputs)
 
         with self.compute_loss_context_manager():
-            loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
+
+            with self.compute_loss_context_manager():
+            def backward_hook(module, grad_input, grad_output):
+                for i, g in enumerate(grad_output):
+                    if g is not None and torch.isnan(g).any():
+                        logger.warning(f"NaN detected in lora parameter gradients")
+
+            for name, module in model.named_modules():
+                if 'lora' in name.lower():
+                    module.register_full_backward_hook(backward_hook)
+
+            loss , outputs = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch, return_outputs=True)
 
         del inputs
         kwargs = {}
@@ -1650,6 +1661,34 @@ class GaudiTrainer(Trainer):
                     self.accelerator.backward(loss, **kwargs)
             else:
                 self.accelerator.backward(loss, **kwargs)
+        
+        # print("loss =", loss)
+        
+        # for name, param in model.named_parameters():
+        #     if "layers.39.self_attn.q_proj.lora_A" in name and torch.isnan(param.grad).any(): 
+        #         print(f"        training step : Nan detected in  {name}")
+        #         if param.grad is not None:
+        #             print(f"        Gradient Stats for {name}:")
+        #             # print(f"  - Min: {param.grad.min().item()}")
+        #             # print(f"  - Max: {param.grad.max().item()}")
+        #             print(f"        - Mean: {param.grad.mean().item()}")
+        #             print(f"        - Std: {param.grad.std().item()}")
+                    # print(f"  - requires_grad is {param.requires_grad}")
+        #         else:
+        #             print("training step checking model params : No Nans")
+        
+        # if torch.isnan(loss) or torch.isinf(loss):
+        #     print("🚨 Loss is NaN or Inf! Stopping training.")
+        #     exit()
+        
+        # for name, param in self.model.named_parameters():
+            # if param.grad is not None:
+                # if torch.isnan(param.grad).any() or torch.isnan(param).any():
+                    # print(f"🚨 NaN or Inf found in gradients of {name}")
+                    # print({param})
+                    # print({param.grad})
+                    # exit()
+
         return loss.detach()
 
     def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
