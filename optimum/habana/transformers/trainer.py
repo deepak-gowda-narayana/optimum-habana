@@ -1604,8 +1604,6 @@ class GaudiTrainer(Trainer):
         inputs = self._prepare_inputs(inputs)
 
         with self.compute_loss_context_manager():
-
-            with self.compute_loss_context_manager():
             def backward_hook(module, grad_input, grad_output):
                 for i, g in enumerate(grad_output):
                     if g is not None and torch.isnan(g).any():
