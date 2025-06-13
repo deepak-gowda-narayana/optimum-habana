@@ -31,7 +31,6 @@ def gaudi_llama4_rotary_embedding_forward(self, x, position_ids):
             sin = sin * self.attention_scaling
             cos = cos * self.attention_scaling
             freqs_cis = (sin, cos)
-        print(freqs_cis)
         return freqs_cis
 
 
@@ -59,17 +58,26 @@ def eager_attention_forward(
 
     return attn_output, attn_weights
 
+def rotate(x, sin, cos):
+    x_even = x[..., ::2]
+    x_odd = x[..., 1::2]
+    return torch.cat([
+        x_even * cos - x_odd * sin,
+        x_odd * cos + x_even * sin
+    ], dim=-1)
+
 
 def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    xq_out = torch.view_as_real(xq_ * freqs_cis[:, :, None, :]).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis[:, :, None, :]).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
+    sin, cos = freqs_cis
+    cos = cos.unsqueeze(-2).to(xq.dtype)
+    sin = sin.unsqueeze(-2).to(xq.dtype)
+    xq_out = rotate(xq, sin, cos)
+    xk_out = rotate(xk, sin, cos)
+    return xq_out, xk_out
 
 class GaudiLlama4TextAttention(Llama4TextAttention):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -95,7 +103,7 @@ class GaudiLlama4TextAttention(Llama4TextAttention):
 
         if self.use_rope:  # the 16E model skips rope for long context on certain layers
             query_states, key_states = apply_rotary_emb(
-                query_states, key_states, position_embeddings.to(query_states.device)
+                query_states, key_states, position_embeddings
             )
 
         if hasattr(self, "qk_norm"):  # the 128E model does not use qk_norm
