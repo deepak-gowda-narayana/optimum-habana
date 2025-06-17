@@ -7,56 +7,49 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 
-from transformers.cache_utils import Cache
+from transformers.cache_utils import Cache , DynamicCache
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.processing_utils import Unpack
 from transformers.models.llama4.configuration_llama4 import Llama4TextConfig
-from transformers.models.llama4.modeling_llama4 import Llama4TextAttention
+from transformers.models.llama4.modeling_llama4 import Llama4TextAttention, eager_attention_forward
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 def gaudi_llama4_rotary_embedding_forward(self, x, position_ids):
-        if "dynamic" in self.rope_type:
-            self._dynamic_frequency_update(position_ids, device=x.device)
-        # Core RoPE block
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
-        position_ids_expanded = position_ids[:, None, :].float()
-        # Force float32 (see https://github.com/huggingface/transformers/pull/29285)
-        device_type = x.device.type
-        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
-        with torch.autocast(device_type=device_type, enabled=False):
-            freqs = (inv_freq_expanded.to(x.device) @ position_ids_expanded).transpose(1, 2)
-            sin = freqs.sin()
-            cos = freqs.cos()
-            sin = sin * self.attention_scaling
-            cos = cos * self.attention_scaling
-            freqs_cis = (sin, cos)
-        return freqs_cis
+    """
+    Copied from https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/models/llama4/modeling_llama4.py#L229 forward call of Llama4TextRotaryEmbedding. 
+    The difference is :
+    -   Computes rotary positional embeddings (RoPE) using real-valued sin and cos functions,
+        adapted for Gaudi hardware compatibility. Unlike the standard implementation that uses 
+        `torch.polar` to produce complex tensors(unsupported on Gaudi)
 
+    Args:
+        x (torch.Tensor): Input tensor to which the rotary embeddings will be applied.
+            Shape [batch_size, seq_len, num_heads, head_dim].
+        position_ids (torch.LongTensor): Tensor of position indices for each token in the sequence.
+            Shape [batch_size, seq_len].
 
-def eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    scaling: float,
-    dropout: float = 0.0,
-    **kwargs,
-):
-    key_states = repeat_kv(key, module.num_key_value_groups)
-    value_states = repeat_kv(value, module.num_key_value_groups)
-    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) / math.sqrt(module.head_dim)
-    if attention_mask is not None:
-        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = attn_weights + causal_mask
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: A tuple of (sin, cos) frequency tensors to be
+        applied in the rotary embedding step.
+    """
+    if "dynamic" in self.rope_type:
+        self._dynamic_frequency_update(position_ids, device=x.device)
+    # Core RoPE block
+    inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+    position_ids_expanded = position_ids[:, None, :].float()
+    # Force float32 (see https://github.com/huggingface/transformers/pull/29285)
+    device_type = x.device.type
+    device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+    with torch.autocast(device_type=device_type, enabled=False):
+        freqs = (inv_freq_expanded.to(x.device) @ position_ids_expanded).transpose(1, 2)
+        sin = freqs.sin()
+        cos = freqs.cos()
+        sin = sin * self.attention_scaling
+        cos = cos * self.attention_scaling
+        freqs_cis = (sin, cos)
+    return freqs_cis
 
-    attn_weights = nn.functional.softmax(attn_weights.float(), dim=-1).to(query.dtype)
-    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
-    attn_output = torch.matmul(attn_weights, value_states)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-
-    return attn_output, attn_weights
 
 def rotate(x, sin, cos):
     x_even = x[..., ::2]
@@ -80,7 +73,12 @@ def apply_rotary_emb(
     return xq_out, xk_out
 
 class GaudiLlama4TextAttention(Llama4TextAttention):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
+    """Multi-headed attention from 'Attention Is All You Need' paper
+    Copied from JointAttnProcessor2_0.forward: https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/models/llama4/modeling_llama4.py
+        The only differences are:
+        - Reshaping of attn_scales to match query states.
+        - Using custom implementation of rotary positional embeddings 
+    """
 
     def __init__(self, config: Llama4TextConfig, layer_idx):
         super().__init__(config, layer_idx)
@@ -115,7 +113,9 @@ class GaudiLlama4TextAttention(Llama4TextAttention):
             attn_scales = (
                 torch.log(torch.floor((cache_position.float() + 1.0) / self.floor_scale) + 1.0) * self.attn_scale + 1.0
             )
-            attn_scales = attn_scales.view((*input_shape, 1, 1))
+            # Reshape attn_scales from [seq_len] to [batch_size, seq_len, 1, 1] so it can be broadcasted during elementwise scaling of query_states.
+            # Previous reshape assumed enough samples, causing size mismatch.
+            attn_scales = attn_scales.view(1, input_shape[1], 1, 1).expand(input_shape[0], input_shape[1], 1, 1)
             query_states = (query_states * attn_scales).to(query_states.dtype)
 
         query_states = query_states.transpose(1, 2)
@@ -166,6 +166,12 @@ def gaudi_llama4_text_model_forward(
     cache_position: Optional[torch.LongTensor] = None,
     **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
 ) -> Union[Tuple, BaseModelOutputWithPast]:
+    """ 
+    Copied from https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/models/llama4/modeling_llama4.py#L624 forward call of Llama4TextModel
+    The difference is :
+    -   Ensure positional arguments are correctly aligned for the decoder layer call 
+        when using gradient checkpointing, since checkpointing does not support keyword arguments.
+    """
     output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
     output_hidden_states = (
         output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -218,12 +224,12 @@ def gaudi_llama4_text_model_forward(
             layer_outputs = self._gradient_checkpointing_func(
                 decoder_layer.__call__,
                 hidden_states,
-                attention_mask,
                 causal_mask,
                 chunk_causal_mask,
                 position_ids,
                 past_key_values,
                 output_attentions,
+                False,
                 use_cache,
                 cache_position,
                 freq_cis,
