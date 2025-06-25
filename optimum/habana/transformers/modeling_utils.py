@@ -133,6 +133,7 @@ from .models import (
     GaudiMllamaVisionEncoderLayer,
     GaudiMllamaVisionModel,
     GaudiMllamaVisionSdpaAttention,
+    GaudiLlama4TextAttention,
     GaudiMptAttention,
     GaudiMptBlock,
     GaudiMptForCausalLM,
@@ -250,6 +251,8 @@ from .models import (
     gaudi_gpt_neox_model_forward,
     gaudi_invert_attention_mask,
     gaudi_llama_rmsnorm_forward,
+    gaudi_llama4_rotary_embedding_forward,
+    gaudi_llama4_text_model_forward,
     gaudi_MambaForCausalLM_prepare_inputs_for_generation,
     gaudi_MambaForCausalLM_update_model_kwargs_for_generation,
     gaudi_mistral_rmsnorm_forward,
@@ -497,6 +500,11 @@ def adapt_transformers_to_gaudi():
     transformers.models.llama.modeling_llama.LlamaRotaryEmbedding = GaudiLlamaRotaryEmbedding
     transformers.models.llama.modeling_llama.LlamaRMSNorm.forward = gaudi_llama_rmsnorm_forward
     transformers.models.llama.configuration_llama.LlamaConfig = LlamaConfig
+
+    # Optimization for llama4 on Gaudi
+    transformers.models.llama4.modeling_llama4.Llama4TextAttention = GaudiLlama4TextAttention
+    transformers.models.llama4.modeling_llama4.Llama4TextRotaryEmbedding.forward = gaudi_llama4_rotary_embedding_forward 
+    transformers.models.llama4.modeling_llama4.Llama4TextModel.forward = gaudi_llama4_text_model_forward
 
     # Optimization for llava on Gaudi
     transformers.models.llava.modeling_llava.LlavaForConditionalGeneration = GaudiLlavaForConditionalGeneration
@@ -769,8 +777,8 @@ def adapt_transformers_to_gaudi():
     transformers.AutoConfig.register("deepseek_v2", DeepseekV2Config)
     transformers.AutoModelForCausalLM.register(DeepseekV2Config, DeepseekV2ForCausalLM)
     transformers.AutoTokenizer.register(DeepseekV2Config, fast_tokenizer_class=DeepseekTokenizerFast)
-    transformers.AutoConfig.register("deepseek_v3", DeepseekV3Config)
-    transformers.AutoModelForCausalLM.register(DeepseekV3Config, DeepseekV3ForCausalLM)
+    # transformers.AutoConfig.register("deepseek_v3", DeepseekV3Config)
+    # transformers.AutoModelForCausalLM.register(DeepseekV3Config, DeepseekV3ForCausalLM)
 
     # Optimization for cohere on Gaudi
     transformers.models.cohere.modeling_cohere.CohereDecoderLayer = GaudiCohereDecoderLayer
